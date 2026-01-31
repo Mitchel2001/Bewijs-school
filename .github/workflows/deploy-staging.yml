@@ -1,0 +1,116 @@
+name: Deploy to Staging
+# Build images and deploy backend/frontend to the staging Cloud Run services.
+
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+
+env:
+  # Environment-specific settings and secrets used by the deploy steps.
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+  REGION: us-central1
+  ARTIFACT_REGISTRY: fan-app-images
+  BACKEND_SERVICE: fan-backend-staging
+  FRONTEND_SERVICE: fan-frontend-staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        # Use a service account key stored in GitHub Secrets.
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        # Allow Docker to push to Artifact Registry in this region.
+        run: |
+          gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+      - name: Get short SHA
+        # Handy for logs or tagging in follow-up steps.
+        id: sha
+        run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build and push backend image
+        # Build a commit-specific tag plus a stable staging tag.
+        run: |
+          docker build -f backend/Dockerfile.prod \
+            -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:${GITHUB_SHA} \
+            -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:staging \
+            .
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:${GITHUB_SHA}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:staging
+
+      - name: Build and push frontend image
+        # Build a commit-specific tag plus a stable staging tag.
+        run: |
+          docker build -f frontend/Dockerfile.prod \
+            -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:${GITHUB_SHA} \
+            -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:staging \
+            .
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:${GITHUB_SHA}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:staging
+
+      - name: Deploy backend to Cloud Run
+        # Deploy backend with environment variables and secrets for staging.
+        run: |
+          gcloud run deploy ${BACKEND_SERVICE} \
+            --image ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:${GITHUB_SHA} \
+            --region ${REGION} \
+            --platform managed \
+            --allow-unauthenticated \
+            --set-env-vars "$(cat <<EOF
+          DATABASE_URL=${{ secrets.STAGING_DATABASE_URL }},SECRET_KEY=${{ secrets.STAGING_SECRET_KEY }},ALLOWED_HOSTS=${{ secrets.STAGING_ALLOWED_HOSTS }},CORS_ALLOWED_ORIGINS=${{ secrets.STAGING_CORS_ALLOWED_ORIGINS }},FRONTEND_URL=${{ secrets.STAGING_FRONTEND_URL }},EMAIL_BACKEND=${{ secrets.STAGING_EMAIL_BACKEND }},DEFAULT_FROM_EMAIL=${{ secrets.STAGING_DEFAULT_FROM_EMAIL }},BREVO_API_KEY=${{ secrets.STAGING_BREVO_API_KEY }},BREVO_TEMPLATE_ID=${{ secrets.STAGING_BREVO_TEMPLATE_ID }},BREVO_SENDER_EMAIL=${{ secrets.STAGING_BREVO_SENDER_EMAIL }},BREVO_SENDER_NAME=${{ secrets.STAGING_BREVO_SENDER_NAME }},SESSION_COOKIE_NAME=${{ secrets.STAGING_SESSION_COOKIE_NAME }},DEBUG=0
+          EOF
+          )" \
+            --add-cloudsql-instances ${{ secrets.STAGING_CLOUDSQL_INSTANCE }} \
+            --set-secrets "SECRET_KEY=STAGING_SECRET_KEY:latest,BREVO_API_KEY=STAGING_BREVO_API_KEY:latest" \
+            --memory 512Mi \
+            --cpu 1 \
+            --timeout 300 \
+            --max-instances 10
+
+      - name: Get backend URL
+        # Capture the backend URL to inject into the frontend deployment.
+        id: backend-url
+        run: |
+          BACKEND_URL=$(gcloud run services describe ${BACKEND_SERVICE} --region ${REGION} --format 'value(status.url)')
+          echo "BACKEND_URL=${BACKEND_URL}" >> $GITHUB_OUTPUT
+          echo "Backend deployed at: ${BACKEND_URL}"
+
+      - name: Deploy frontend to Cloud Run
+        # Point the frontend to the freshly deployed backend.
+        run: |
+          gcloud run deploy ${FRONTEND_SERVICE} \
+            --image ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:${GITHUB_SHA} \
+            --region ${REGION} \
+            --platform managed \
+            --allow-unauthenticated \
+            --set-env-vars "NEXT_PUBLIC_API_BASE=${{ steps.backend-url.outputs.BACKEND_URL }},NODE_ENV=production" \
+            --memory 512Mi \
+            --cpu 1 \
+            --timeout 300 \
+            --max-instances 10
+
+      - name: Output deployment URLs
+        # Print final service URLs for quick access.
+        run: |
+          echo "=== Deployment Complete ==="
+          echo "Backend: ${{ steps.backend-url.outputs.BACKEND_URL }}"
+          FRONTEND_URL=$(gcloud run services describe ${FRONTEND_SERVICE} --region ${REGION} --format 'value(status.url)')
+          echo "Frontend: ${FRONTEND_URL}"

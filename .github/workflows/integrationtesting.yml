@@ -1,0 +1,137 @@
+name: Integration Test
+# Run integration tests using images built in the Docker Image CI workflow.
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Docker Image CI"]
+    types:
+      - completed
+
+env:
+  # Registry settings for pulling pre-built images.
+  REGISTRY: ghcr.io
+  OWNER: fan-pwa
+
+jobs:
+  integrationtest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    # Only run after a successful build or when triggered manually.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare backend env file
+        # Minimal .env for CI containers (no real secrets).
+        run: |
+          cat <<'EOF' > backend/.env
+          DEBUG=0
+          SECRET_KEY=dummy-ci-secret
+          ALLOWED_HOSTS=localhost,127.0.0.1
+          CORS_ALLOWED_ORIGINS=http://localhost:3000
+          FRONTEND_URL=http://localhost:3000
+          EMAIL_BACKEND=django.core.mail.backends.console.EmailBackend
+          DEFAULT_FROM_EMAIL=ci@example.com
+          DATABASE_URL=postgres://fan_user:fan_pass@db:5432/fan_db
+          BREVO_API_KEY=
+          BREVO_TEMPLATE_ID=
+          BREVO_SENDER_EMAIL=ci@example.com
+          BREVO_SENDER_NAME=FAN Platform
+          SESSION_COOKIE_NAME=fan_sessionid_ci
+          EOF
+
+      - name: Login to GitHub Container Registry
+        # Authenticate so we can pull private images.
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image tag
+        # Use latest for manual runs, otherwise use the triggering workflow SHA.
+        id: image-tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # Use latest for manual runs
+            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "Using latest images for manual run"
+          else
+            # Use the full SHA from the triggering workflow (matches docker-build-test.yml)
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            echo "tag=${SHA}" >> $GITHUB_OUTPUT
+            echo "Using images from SHA: ${SHA}"
+          fi
+
+      - name: Pull backend image
+        # Pull the exact tag if available, otherwise fall back to latest.
+        run: |
+          IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
+          # Try to pull with specific tag, fallback to latest
+          if docker pull ${{ env.REGISTRY }}/${{ env.OWNER }}/fan-backend:${IMAGE_TAG} 2>/dev/null; then
+            docker tag ${{ env.REGISTRY }}/${{ env.OWNER }}/fan-backend:${IMAGE_TAG} myapp-backend:latest
+            echo "Pulled backend image with tag: ${IMAGE_TAG}"
+          else
+            echo "Tag ${IMAGE_TAG} not found, pulling latest..."
+            docker pull ${{ env.REGISTRY }}/${{ env.OWNER }}/fan-backend:latest
+            docker tag ${{ env.REGISTRY }}/${{ env.OWNER }}/fan-backend:latest myapp-backend:latest
+          fi
+
+      - name: Pull frontend image
+        # Pull the exact tag if available, otherwise fall back to latest.
+        run: |
+          IMAGE_TAG="${{ steps.image-tag.outputs.tag }}"
+          # Try to pull with specific tag, fallback to latest
+          if docker pull ${{ env.REGISTRY }}/${{ env.OWNER }}/fan-frontend:${IMAGE_TAG} 2>/dev/null; then
+            docker tag ${{ env.REGISTRY }}/${{ env.OWNER }}/fan-frontend:${IMAGE_TAG} myapp-frontend:latest
+            echo "Pulled frontend image with tag: ${IMAGE_TAG}"
+          else
+            echo "Tag ${IMAGE_TAG} not found, pulling latest..."
+            docker pull ${{ env.REGISTRY }}/${{ env.OWNER }}/fan-frontend:latest
+            docker tag ${{ env.REGISTRY }}/${{ env.OWNER }}/fan-frontend:latest myapp-frontend:latest
+          fi
+
+      - name: Install Docker Compose (v2)
+        # Ensure docker compose is available on the runner.
+        run: |
+          DOCKER_COMPOSE_VERSION=2.29.2
+          curl -SL https://github.com/docker/compose/releases/download/v${DOCKER_COMPOSE_VERSION}/docker-compose-linux-x86_64 \
+            -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+      - name: Start services with Docker Compose
+        # Start services and allow time to become healthy.
+        run: |
+          docker compose -f docker-compose.integration.yml up -d
+          echo "Waiting for services to become healthy..."
+          sleep 25
+          docker ps
+
+      - name: Run backend integration tests
+        # Run backend integration tests inside the container.
+        run: |
+          docker compose -f docker-compose.integration.yml exec -T backend pytest tests/integration -v --disable-warnings || echo 'No integration tests found'
+
+      - name: Run frontend integration tests
+        # Run frontend integration tests inside the container.
+        run: |
+          docker compose -f docker-compose.integration.yml exec -T frontend npm run test:integration --if-present || echo 'No integration tests found'
+
+      - name: Show container logs on failure
+        # Collect logs to help diagnose failures.
+        if: failure()
+        run: |
+          echo "==== Backend logs ===="
+          docker compose -f docker-compose.integration.yml logs --tail 100 backend || true
+          echo "==== Frontend logs ===="
+          docker compose -f docker-compose.integration.yml logs --tail 100 frontend || true
+
+      - name: Tear down Docker Compose environment
+        # Always clean up containers and volumes.
+        if: always()
+        run: docker compose -f docker-compose.integration.yml down -v

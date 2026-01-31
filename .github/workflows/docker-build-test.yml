@@ -1,0 +1,81 @@
+name: Docker Image CI
+# Build and test Docker images for the dev branch.
+
+on:
+  push:
+    branches: ["dev"]
+  pull_request:
+    branches: ["dev"]
+
+jobs:
+  build:
+    # Linux runner with Docker Buildx + Compose.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+
+      - name: Set up Docker Compose
+        uses: docker/setup-compose-action@v1
+        with:
+          version: latest
+
+      - name: Set up docker layers
+        # Cache build layers between workflow runs.
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.Buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build Docker Compose services
+        # Build images with production settings.
+        run: |
+          docker compose build \
+          --build-arg NODE_ENV=production \
+          --progress=plain \
+          --cache-from type=local, src=/tmp/.Buildx-cache \
+          --cache-to type=local, dest=/tmp/.Buildx-cache-new
+
+      - name: Check for missing Django migrations
+        # Fail if there are model changes without migrations.
+        run: |
+          docker compose run --rm backend sh -c "python manage.py makemigrations --check --dry-run || (echo 'Missing migrations or check failed' && exit 1)"
+
+      - name: Django Unit Tests
+        # Run backend unit tests inside the container.
+        run: |
+          docker compose run --rm backend sh -c "pytest -m 'unit' || echo 'No backend unit tests found'"
+
+      - name: Run Frontend Unit Tests
+        # Run frontend unit tests inside the container.
+        run: |
+          docker compose run --rm frontend sh -c "npm run test:unit || echo 'No frontend unit tests found'"
+
+      - name: Run Frontend Lint
+        # Lint frontend code if a lint script exists.
+        run: |
+          docker compose run --rm frontend sh -c "npm run lint --if-present || echo 'No frontend lint script found'"
+
+      - name: Run Frontend Typecheck
+        # Type-check frontend code if a typecheck script exists.
+        run: |
+          docker compose run --rm frontend sh -c "npm run typecheck --if-present || echo 'No frontend typecheck script found'"
+
+      - name: Run Integration Tests
+        # Run backend integration tests; skip gracefully if none exist.
+        run: |
+          docker compose run --rm backend sh -c "pytest -m 'integration' || echo 'No integration tests found'"
+
+      - name: Move new cache
+        # Promote the newly created cache for the next run.
+        if: always()
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache

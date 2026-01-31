@@ -1,0 +1,133 @@
+name: Deploy to Dev Cloud environment
+# Build images and deploy backend/frontend to the dev Cloud Run services.
+
+on:
+  push:
+    branches:
+      - dev.2
+  workflow_dispatch:
+
+env:
+  # Environment-specific settings and secrets used by the deploy steps.
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+  REGION: europe-west4
+  ARTIFACT_REGISTRY: fan-app-images
+  BACKEND_SERVICE: fan-backend
+  FRONTEND_SERVICE: fan-frontend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      # Map the GitHub environment to the deployed frontend URL.
+      name: production
+      url: ${{ steps.frontend-url.outputs.URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        # Use a service account key stored in GitHub Secrets.
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # - name: Set DB password from Secret Manager
+      #   run: |
+      #     FAN_USER_PASS=$(gcloud secrets versions access latest --secret="fan-user-password")
+      #     echo "FAN_USER_PASS=$FAN_USER_PASS" >> $GITHUB_ENV
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        # Allow Docker to push to Artifact Registry in this region.
+        run: |
+          gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+      - name: Build and push backend image
+        # Build a commit-specific tag plus a stable latest tag.
+        run: |
+          docker build -f backend/Dockerfile.prod \
+            -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:${GITHUB_SHA} \
+            -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:latest \
+            .
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:${GITHUB_SHA}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/backend:latest
+
+      - name: Build and push frontend image
+        # Build a commit-specific tag plus a stable latest tag.
+        run: |
+          docker build -f frontend/Dockerfile.prod \
+            -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:${GITHUB_SHA} \
+            -t ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:latest \
+            .
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:${GITHUB_SHA}
+          docker push ${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/frontend:latest
+
+      # - name: Remove SECRET_KEY env var if exists
+      #   run: |
+      #     gcloud run services update "${s{ env.BACKEND_SERVICE }}" \
+      #     --region "${s{ env.REGION }}" \
+      #     --remove-env-vars "SECRET_KEY" || true
+
+      - name: Deploy Backend to Cloud Run
+        # Deploy backend with env vars + secrets from Secret Manager.
+        run: |
+          gcloud run deploy "${{ env.BACKEND_SERVICE }}" \
+          --image "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY }}/backend:${{ github.sha }}" \
+          --region "${{ env.REGION }}" \
+          --platform managed \
+          --allow-unauthenticated \
+          --set-env-vars "CLOUDSQL_CONNECTION_NAME=${{ secrets.DEV_CLOUDSQL_INSTANCE }}" \
+          --set-env-vars "ALLOWED_HOSTS=${{ secrets.DEV_ALLOWED_HOSTS }}" \
+          --set-env-vars "FRONTEND_URL=${{ secrets.DEV_FRONTEND_URL }}" \
+          --set-env-vars "EMAIL_BACKEND=${{ secrets.DEV_EMAIL_BACKEND }}" \
+          --set-env-vars "DEFAULT_FROM_EMAIL=${{ secrets.DEV_DEFAULT_FROM_EMAIL }}" \
+          --set-env-vars "BREVO_TEMPLATE_ID=${{ secrets.DEV_BREVO_TEMPLATE_ID }}" \
+          --set-env-vars "BREVO_SENDER_EMAIL=${{ secrets.DEV_BREVO_SENDER_EMAIL }}" \
+          --set-env-vars "BREVO_SENDER_NAME=${{ secrets.DEV_BREVO_SENDER_NAME }}" \
+          --set-env-vars "SESSION_COOKIE_NAME=${{ secrets.DEV_SESSION_COOKIE_NAME }}" \
+          --set-env-vars "DB_NAME=fan-db-dev" \
+          --set-env-vars "DEBUG=1" \
+          --add-cloudsql-instances "${{ secrets.DEV_CLOUDSQL_INSTANCE }}" \
+          --update-secrets "SECRET_KEY=DEV_SECRET_KEY:latest,BREVO_API_KEY=DEV_BREVO_API_KEY:latest,FAN_USER_PASS=fan-user-password:latest,CORS_ALLOWED_ORIGINS=DEV_CORS_ALLOWED_ORIGINS:latest,CSRF_TRUSTED_ORIGINS=DEV_CSRF_TRUSTED_ORIGINS:latest" \
+          --memory 1Gi \
+          --cpu 2 \
+          --timeout 300 \
+          --max-instances 10
+
+      - name: Get Backend URL
+        # Capture the backend URL to inject into the frontend deployment.
+        id: backend-url
+        run: |
+          BACKEND_URL=$(gcloud run services describe ${BACKEND_SERVICE} --region ${REGION} --format 'value(status.url)')
+          echo "BACKEND_URL=${BACKEND_URL}" >> $GITHUB_OUTPUT
+          echo "Backend deployed at: ${BACKEND_URL}"
+
+      - name: Deploy Frontend to Cloud Run
+        # Point the frontend to the freshly deployed backend.
+        run: |
+          gcloud run deploy "${{ env.FRONTEND_SERVICE }}" \
+            --image "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY }}/frontend:${{ github.sha }}" \
+            --region "${{ env.REGION }}" \
+            --platform managed \
+            --allow-unauthenticated \
+            --set-env-vars "NEXT_PUBLIC_API_BASE=${{ steps.backend-url.outputs.BACKEND_URL }},NODE_ENV=development" \
+            --memory 1Gi \
+            --cpu 2 \
+            --timeout 300 \
+            --max-instances 10
+
+      - name: Get Frontend URL
+        # Output the deployed frontend URL for GitHub environment metadata.
+        id: frontend-url
+        run: |
+          FRONTEND_URL=$(gcloud run services describe ${FRONTEND_SERVICE} --region ${REGION} --format 'value(status.url)')
+          echo "FRONTEND_URL=${FRONTEND_URL}" >> $GITHUB_OUTPUT
+          echo "Frontend deployed at: ${FRONTEND_URL}"
