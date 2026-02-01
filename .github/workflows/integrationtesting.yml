@@ -115,12 +115,12 @@ jobs:
       - name: Run backend integration tests
         # Run backend integration tests inside the container.
         run: |
-          docker compose -f docker-compose.integration.yml exec -T backend pytest tests/integration -v --disable-warnings || echo 'No integration tests found'
+          docker compose -f docker-compose.integration.yml exec -T backend sh -c 'if [ ! -d tests/integration ]; then echo "No integration tests directory (tests/integration)"; exit 0; fi; pytest tests/integration -v --disable-warnings; rc=$?; if [ $rc -eq 5 ]; then echo "No integration tests found"; exit 0; fi; exit $rc'
 
       - name: Run frontend integration tests
         # Run frontend integration tests inside the container.
         run: |
-          docker compose -f docker-compose.integration.yml exec -T frontend npm run test:integration --if-present || echo 'No integration tests found'
+          docker compose -f docker-compose.integration.yml exec -T frontend npm run test:integration --if-present
 
       - name: Show container logs on failure
         # Collect logs to help diagnose failures.

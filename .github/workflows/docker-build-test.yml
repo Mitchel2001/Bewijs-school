@@ -51,12 +51,12 @@ jobs:
       - name: Django Unit Tests
         # Run backend unit tests inside the container.
         run: |
-          docker compose run --rm backend sh -c "pytest -m 'unit' || echo 'No backend unit tests found'"
+          docker compose run --rm backend sh -c 'pytest -m "unit"; rc=$?; if [ $rc -eq 5 ]; then echo "No backend unit tests found"; exit 0; fi; exit $rc'
 
       - name: Run Frontend Unit Tests
         # Run frontend unit tests inside the container.
         run: |
-          docker compose run --rm frontend sh -c "npm run test:unit || echo 'No frontend unit tests found'"
+          docker compose run --rm frontend sh -c 'npm run test:unit --if-present'
 
       - name: Run Frontend Lint
         # Lint frontend code if a lint script exists.
@@ -71,7 +71,7 @@ jobs:
       - name: Run Integration Tests
         # Run backend integration tests; skip gracefully if none exist.
         run: |
-          docker compose run --rm backend sh -c "pytest -m 'integration' || echo 'No integration tests found'"
+          docker compose run --rm backend sh -c 'pytest -m "integration"; rc=$?; if [ $rc -eq 5 ]; then echo "No integration tests found"; exit 0; fi; exit $rc'
 
       - name: Move new cache
         # Promote the newly created cache for the next run.
